@@ -9,6 +9,7 @@ opencv-contrib-python
 imageio
 pyyaml
 open3d
+pyzmq
 
 # === TensorRT (optional — uncomment if needed) ===
 # onnx

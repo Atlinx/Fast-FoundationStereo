@@ -99,7 +99,7 @@ class SingleEngineTrtRunner:
 
     def __call__(self, inputs: dict) -> dict:
         """Run inference.
-
+        
         Args:
             inputs: {binding_name: torch.Tensor} for every input tensor.
         Returns:
