@@ -38,17 +38,20 @@ Request:
   part2: right image raw bytes
 
 Response (success):
-  part0: JSON metadata bytes, fields:
-    {
-      "ok": true,
-      "depth_shape": [H, W],
-      "depth_dtype": "float32",
-      "disp_shape": [H, W],
-      "disp_dtype": "float32",
-      "inference_ms": float
-    }
-  part1: depth raw bytes (meters)
-  part2: disparity raw bytes (pixels)
+    part0: JSON metadata bytes, fields:
+        {
+            "ok": true,
+            "return_type": "disparity" | "depth" | "point_cloud",
+            "inference_ms": float,
+            ...type-specific fields...
+        }
+    return_type == "disparity":
+        part1: disparity raw bytes, with output_shape/output_dtype in part0
+    return_type == "depth":
+        part1: depth raw bytes, with output_shape/output_dtype in part0
+    return_type == "point_cloud":
+        part1: points raw bytes [N, 3] float32, with points_shape/points_dtype in part0
+        part2: colors raw bytes [N, 3] uint8, with colors_shape/colors_dtype in part0
 
 Response (error):
   part0: JSON metadata bytes, fields:
@@ -69,10 +72,11 @@ import torch
 import yaml
 import zmq
 
-code_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(f"{code_dir}/../")
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+REPO_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
+sys.path.append(f"{SCRIPT_DIR}/../")
 
-from Utils import set_logging_format, set_seed
+from Utils import depth2xyzmap, set_logging_format, set_seed
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -313,14 +317,17 @@ class FastFoundationStereoServer:
             disp = cv2.resize(disp, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
         disp = disp * (1.0 / sx)
 
+        # Match run_demo_single_trt behavior: visualization uses raw disparity.
+        # remove_invisible should only affect depth/point-cloud computation.
+        disp_for_depth = disp.copy()
         if self.remove_invisible:
             _, xx = np.meshgrid(np.arange(orig_h), np.arange(orig_w), indexing="ij")
-            invalid = (xx - disp) < 0
-            disp[invalid] = np.inf
+            invalid = (xx - disp_for_depth) < 0
+            disp_for_depth[invalid] = np.inf
 
-        depth = np.full_like(disp, np.inf, dtype=np.float32)
-        valid = np.isfinite(disp) & (disp > 0.0)
-        depth[valid] = (fx_orig * baseline) / disp[valid]
+        depth = np.full_like(disp_for_depth, np.inf, dtype=np.float32)
+        valid = np.isfinite(disp_for_depth) & (disp_for_depth > 0.0)
+        depth[valid] = (fx_orig * baseline) / disp_for_depth[valid]
         return depth.astype(np.float32), disp.astype(np.float32), infer_ms
 
     def _handle_request(self, parts):
@@ -346,25 +353,87 @@ class FastFoundationStereoServer:
 
         fx = float(meta["fx"])
         baseline = float(meta["baseline"])
+        return_type = meta.get("return_type", "depth")
         if fx <= 0.0:
             raise ValueError("fx must be positive")
         if baseline <= 0.0:
             raise ValueError("baseline must be positive")
+        if return_type not in {"disparity", "depth", "point_cloud"}:
+            raise ValueError(
+                f"Unsupported return_type '{return_type}'. "
+                "Expected one of: disparity, depth, point_cloud"
+            )
 
         depth, disp, inference_ms = self._infer_depth(left, right, fx, baseline)
+        fps = 1000.0 / inference_ms if inference_ms > 0.0 else float("inf")
+        logging.info(
+            "Handled request return_type=%s shape=%dx%d inference=%.2f ms (%.2f FPS)",
+            return_type,
+            left.shape[1],
+            left.shape[0],
+            inference_ms,
+            fps,
+        )
+
+        if return_type == "disparity":
+            res_meta = {
+                "ok": True,
+                "return_type": "disparity",
+                "output_shape": list(disp.shape),
+                "output_dtype": str(disp.dtype),
+                "inference_ms": inference_ms,
+            }
+            self.socket.send_multipart(
+                [
+                    json.dumps(res_meta).encode("utf-8"),
+                    disp.tobytes(order="C"),
+                ]
+            )
+            return
+
+        if return_type == "depth":
+            res_meta = {
+                "ok": True,
+                "return_type": "depth",
+                "output_shape": list(depth.shape),
+                "output_dtype": str(depth.dtype),
+                "inference_ms": inference_ms,
+            }
+            self.socket.send_multipart(
+                [
+                    json.dumps(res_meta).encode("utf-8"),
+                    depth.tobytes(order="C"),
+                ]
+            )
+            return
+
+        h, w = depth.shape[:2]
+        fy = float(meta.get("fy", fx))
+        cx = float(meta.get("cx", (w - 1.0) * 0.5))
+        cy = float(meta.get("cy", (h - 1.0) * 0.5))
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+        xyz_map = depth2xyzmap(depth, K)
+
+        points = xyz_map.reshape(-1, 3)
+        colors = left.reshape(-1, 3)
+        valid = np.isfinite(points).all(axis=1) & (points[:, 2] > 0.0)
+        points = points[valid].astype(np.float32, copy=False)
+        colors = colors[valid].astype(np.uint8, copy=False)
+
         res_meta = {
             "ok": True,
-            "depth_shape": list(depth.shape),
-            "depth_dtype": str(depth.dtype),
-            "disp_shape": list(disp.shape),
-            "disp_dtype": str(disp.dtype),
+            "return_type": "point_cloud",
+            "points_shape": list(points.shape),
+            "points_dtype": str(points.dtype),
+            "colors_shape": list(colors.shape),
+            "colors_dtype": str(colors.dtype),
             "inference_ms": inference_ms,
         }
         self.socket.send_multipart(
             [
                 json.dumps(res_meta).encode("utf-8"),
-                depth.tobytes(order="C"),
-                disp.tobytes(order="C"),
+                points.tobytes(order="C"),
+                colors.tobytes(order="C"),
             ]
         )
 
@@ -389,7 +458,7 @@ def _parse_args():
     parser.add_argument(
         "--model_dir",
         type=str,
-        default=f"{code_dir}/output",
+        default=f"{REPO_DIR}/output",
         help="Directory containing .engine/.onnx + matching YAML config",
     )
     parser.add_argument(
@@ -407,7 +476,7 @@ def _parse_args():
     parser.add_argument(
         "--remove_invisible",
         type=int,
-        default=1,
+        default=0,
         help="Mask disparities where right-image correspondence is out of bounds",
     )
     return parser.parse_args()
