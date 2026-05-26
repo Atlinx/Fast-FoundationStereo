@@ -11,6 +11,9 @@ pyyaml
 open3d
 pyzmq
 
+# === Profiling ===
+line-profiler
+
 # === TensorRT (optional — uncomment if needed) ===
 # onnx
 # onnxruntime-gpu

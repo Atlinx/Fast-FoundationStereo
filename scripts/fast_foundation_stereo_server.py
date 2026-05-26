@@ -59,6 +59,8 @@ Response (error):
 """
 
 import argparse
+import atexit
+import io
 import json
 import logging
 import os
@@ -71,6 +73,11 @@ import numpy as np
 import torch
 import yaml
 import zmq
+
+try:
+    from line_profiler import LineProfiler
+except ImportError:
+    LineProfiler = None
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 REPO_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, ".."))
@@ -244,12 +251,16 @@ class FastFoundationStereoServer:
         model_path: str,
         bind_address: str,
         remove_invisible: bool = True,
+        profile: bool = False,
+        profile_output: str = "server.lprof",
     ):
         cfg_path = resolve_config(model_path)
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
         self.target_h, self.target_w = cfg["image_size"]
         self.remove_invisible = remove_invisible
+        self._profiler = None
+        self._profile_output = profile_output
 
         if model_path.endswith(".onnx"):
             self.runner = OnnxRuntimeRunner(model_path)
@@ -268,6 +279,54 @@ class FastFoundationStereoServer:
         logging.info("Backend: %s", backend)
         logging.info("Model target resolution: %dx%d", self.target_h, self.target_w)
         logging.info("Listening on %s", bind_address)
+
+        if profile:
+            self._enable_profiling()
+
+    def _enable_profiling(self):
+        if LineProfiler is None:
+            raise RuntimeError(
+                "line_profiler is not installed. Install it with 'pip install line_profiler' "
+                "or add it to your environment before using --profile_functions."
+            )
+        self._profiler = LineProfiler()
+        self._profiler.add_function(self._infer_depth)
+        self._profiler.add_function(self._handle_request)
+
+        destination = self._profile_output if self._profile_output else "stderr"
+        logging.info(
+            "line_profiler enabled; stats will be written to %s",
+            destination,
+        )
+
+    def _dump_profile_stats(self):
+        print("try dumping line_profiler stats...")
+        if self._profiler is None:
+            return
+
+        print("dumping line_profiler stats...")
+        stream = None
+        close_stream = False
+        try:
+            if self._profile_output:
+                stream = open(self._profile_output, "w", encoding="utf-8")
+                close_stream = True
+            else:
+                stream = io.StringIO()
+
+            self._profiler.print_stats(stream=stream)
+
+            if close_stream:
+                logging.info("Wrote line_profiler stats to %s", self._profile_output)
+            else:
+                profile_report = stream.getvalue().strip()
+                if profile_report:
+                    logging.info("line_profiler stats:\n%s", profile_report)
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.exception("Failed to write line_profiler stats: %s", exc)
+        finally:
+            if close_stream and stream is not None:
+                stream.close()
 
     def _infer_depth(
         self,
@@ -449,6 +508,9 @@ class FastFoundationStereoServer:
                 logging.exception("Failed processing request")
                 err = {"ok": False, "error": str(exc)}
                 self.socket.send_multipart([json.dumps(err).encode("utf-8")])
+        
+        if self._profiler is not None:
+            self._dump_profile_stats()
 
 
 def _parse_args():
@@ -479,6 +541,18 @@ def _parse_args():
         default=0,
         help="Mask disparities where right-image correspondence is out of bounds",
     )
+    parser.add_argument(
+        "--profile",
+        type=bool,
+        default=False,
+        help="Enable profiling",
+    )
+    parser.add_argument(
+        "--profile_output",
+        type=str,
+        default="server.lprof",
+        help="Optional file path for line_profiler stats; defaults to log output on shutdown",
+    )
     return parser.parse_args()
 
 
@@ -493,5 +567,7 @@ if __name__ == "__main__":
         model_path=model_path,
         bind_address=args.bind,
         remove_invisible=bool(args.remove_invisible),
+        profile=args.profile,
+        profile_output=args.profile_output,
     )
     server.serve_forever()
